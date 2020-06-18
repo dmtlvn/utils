@@ -700,7 +700,7 @@ class MobileNetV3Block:
         return self.module(inputs)
     
     
-class InceptionV1Block:
+class InceptionV1A:
     """
     A parallel set of 1x1, 3x3, 5x5 convolutions and 3x3 max-pooling preceded by
     a 1x1 bottlenecks for dimensionality reduction. 
@@ -720,10 +720,7 @@ class InceptionV1Block:
     
     inputs_3x3 (int) - number of filters in a 5x5 bottleneck
     
-    use_bn (bool) - batch normalization application flag
-    
-    **kwargs - standard set of arguments for a `Conv2D` and `BatchNormalization`
-        classes
+    **kwargs - standard set of arguments for a `ConvBlock` class
     """
     
     def __init__(
@@ -736,32 +733,30 @@ class InceptionV1Block:
         inputs_5x5,
         strides = (1, 1),
         padding = "same",
-        activation = 'linear',
-        use_bn = False, 
+        schema = "CBA",
         **kwargs
     ):    
         super().__init__()
         (conv_kwargs, bn_kwargs), _ = split_kwargs(kwargs, L.Conv2D, L.BatchNormalization)
-        pw_kwargs = dict(conv_kwargs)
-        pw_kwargs["strides"] = (1, 1)
-        pw_kwargs["kernel_size"] = (1, 1)
-        conv_kwargs["strides"] = strides
-        conv_kwargs["padding"] = padding        
-        conv_1x1 = L.Conv2D(filters = filters_1x1, kernel_size = (1, 1), **conv_kwargs)
-        conv_3x3 = L.Conv2D(filters = filters_3x3, kernel_size = (3, 3), **conv_kwargs)
-        conv_5x5 = L.Conv2D(filters = filters_5x5, kernel_size = (5, 5), **conv_kwargs)
-        reduction_3x3 = L.Conv2D(filters = inputs_3x3, **pw_kwargs)
-        reduction_5x5 = L.Conv2D(filters = inputs_5x5, **pw_kwargs)
-        reduction_pool = L.Conv2D(filters = filters_pool, **pw_kwargs)
+        pw_kwargs = dict(
+            strides = (1, 1), kernel_size = (1, 1), schema = schema, **conv_kwargs, **bn_kwargs
+        )
+        conv_kwargs = dict(
+            strides = strides, padding = padding, schema = schema, **conv_kwargs, **bn_kwargs
+        )
+        conv_1x1 = ConvBlock(filters = filters_1x1, kernel_size = (1, 1), **conv_kwargs)
+        conv_3x3 = ConvBlock(filters = filters_3x3, kernel_size = (3, 3), **conv_kwargs)
+        conv_5x5 = ConvBlock(filters = filters_5x5, kernel_size = (5, 5), **conv_kwargs)
+        reduction_3x3 = ConvBlock(filters = inputs_3x3, **pw_kwargs)
+        reduction_5x5 = ConvBlock(filters = inputs_5x5, **pw_kwargs)
+        reduction_pool = ConvBlock(filters = filters_pool, **pw_kwargs)
         pool = L.MaxPooling2D(pool_size = (3, 3), strides = strides, padding = padding)
-        bn = L.BatchNormalization(**bn_kwargs) if use_bn else (lambda x: x)
-        act = _Activation(activation)
         self.module = Composition([
             Parallel([
-                Composition([conv_1x1, bn, act]),
-                Composition([reduction_3x3, bn, act, conv_3x3, bn, act]),
-                Composition([reduction_5x5, bn, act, conv_5x5, bn, act]),
-                Composition([pool, reduction_pool, bn, act]),
+                conv_1x1,
+                Composition([reduction_3x3, conv_3x3]),
+                Composition([reduction_5x5, conv_5x5]),
+                Composition([pool, reduction_pool]),
             ]),
             L.Concatenate(axis = -1)
         ])
