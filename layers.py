@@ -160,6 +160,63 @@ class Downsample(K.layers.Layer):
             return inputs[:, ::self.factor_h, ::self.factor_w, :]
         else:
             return inputs[:, :, ::self.factor_h, ::self.factor_w]
+        
+        
+class Resize(K.layers.Layer):
+    """
+    Resizes an input tensor to a given shape
+    
+    Parameters:
+    
+    target_shape (tuple) - target shape in the form (height, width)
+    
+    interpolation (str) - interpolation algorithm ('nearest', 'bilinear', 
+        'bicubic', 'lanczos3', 'lanczos5', 'gaussian', 'area', 'mitchellcubic')
+        Refer to tensorflow.image.resize documentation for more info. 
+        Default: 'nearest'
+        
+    antialias (bool) - if true, applies antialiasing pre-filtering
+    
+    pad (bool) - if true, keeps the aspect ratio if the input images by padding 
+        it with zeros
+        
+    channels_first (bool) - if true, uses NCHW tensor layout instead of NHWC
+    """
+    
+    def __init__(
+        self, 
+        target_shape, 
+        interpolation = 'nearest',
+        antialias = False,
+        pad = False,
+        channels_first = False, 
+        *args, 
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        target_h, target_w = target_shape
+        self.channels_first = channels_first
+        if not pad:
+            self._resize_op = partial(tf.image.resize,
+                size = (target_h, target_w),
+                method = interpolation,
+                antialias = antialias,
+                preserve_aspect_ratio = False,
+            )
+        else:
+            self._resize_op = partial(tf.image.resize_with_pad,
+                target_height = target_h, 
+                target_width = target_w, 
+                method = interpolation,
+                antialias = antialias,               
+            )
+
+        
+    def call(self, inputs):
+        images = tf.transpose(inputs, [0,2,3,1]) if self.channels_first else inputs
+        outputs = self._resize_op(images)
+        outputs = tf.transpose(outputs, [0,3,1,2]) if self.channels_first else outputs
+        return outputs
     
     
 class GroupConv2D(K.layers.Layer):
@@ -583,26 +640,34 @@ class DropAvg(K.layers.Layer):
     **kwargs - default keras.layers.Layer parameters
     """
     
-    def __init__(self, rate = 0.5, is_global = False, *args, **kwargs):
+    def __init__(self, rate = 0.5, is_global = False, channels_first = False, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.channel_axis = -1 if not channels_first else 1
         self.is_global = is_global
         self.rate = tf.constant(rate, dtype = tf.float32)
         
     def local_strategy(self, inputs):
         n = len(inputs)
-        stack = tf.stack(inputs, axis = -1)
+        stack = tf.stack(inputs, axis = self.channel_axis)
         probs = tf.random.uniform((n,))
         probs = probs / tf.reduce_max(probs)
         idx = tf.cast(tf.where(probs > self.rate), tf.int32)
-        keep = tf.gather(stack, idx, axis = -1)
-        merge = tf.reduce_mean(keep, axis = (-2, -1))
+        keep = tf.gather(stack, idx, axis = self.channel_axis)
+        if self.channel_axis == -1:
+            merge = tf.reduce_mean(keep, axis = (-2, -1))
+        else:
+            merge = tf.reduce_mean(keep, axis = (1, 2))
         return merge
     
     def global_strategy(self, inputs):
         n = len(inputs)
-        stack = tf.stack(inputs, axis = -1)
-        idx = tf.random.int32(n)
-        return stack[...,idx]
+        stack = tf.stack(inputs, axis = self.channel_axis)
+        idx = tf.random.uniform(shape = (1,), minval = 0, maxval = n, dtype = tf.dtypes.int32)
+        if self.channel_axis == -1:
+            keep = stack[:,:,:,idx[0]]
+        else:
+            keep = stack[:,idx[0],:,:]
+        return keep
         
     def call(self, inputs):
         if isinstance(inputs, tf.Tensor):
@@ -680,16 +745,19 @@ class SqueezeExcitation:
         attention coefficients
     """
     
-    def __init__(self, reduction, activation = "sigmoid"):
+    def __init__(self, reduction, activation = "sigmoid", channels_first = False):
+        self.channel_axis = -1 if not channels_first else 1
         self.reduction = reduction
         self.activation = activation
         
     def __call__(self, inputs):
-        _, _, _, C = inputs.shape
-        squeeze = L.GlobalAveragePooling2D()
-        F = L.Dense(units = int(C / self.reduction), activation = 'relu')
-        G = L.Dense(units = C, activation = self.activation)
-        R = L.Reshape(target_shape = (1, 1, C))
+        data_format = "channels_first" if self.channel_axis == 1 else "channels_last"
+        channels = inputs.shape[self.channel_axis]
+        target_shape = [1, 1, channels] if self.channel_axis == -1 else [channels, 1, 1]
+        squeeze = L.GlobalAveragePooling2D(data_format)
+        F = L.Dense(units = int(channels / self.reduction), activation = 'relu')
+        G = L.Dense(units = channels, activation = self.activation)
+        R = L.Reshape(target_shape = target_shape)
         excitation = Composition([squeeze, F, G, R])
         module = SkipConnection(excitation, join = "mul")
         return module(inputs)
