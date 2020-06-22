@@ -6,6 +6,8 @@ import copy
 
 class LazyLayer:
     
+    _layer_ = None
+    
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
@@ -49,6 +51,7 @@ class Meta(type):
 
 
 _layer_list = [
+    L.Downsample,
     L.DropAvg,
     K.Layer,
     K.Input,

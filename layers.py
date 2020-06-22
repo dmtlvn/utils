@@ -1,8 +1,12 @@
 import tensorflow as tf
 import lazylayers as L
 import inspect
+import warnings
 import copy
-from tensorflow.keras import layers as K
+
+from tensorflow import keras as K
+from tensorflow.python.keras.utils import conv_utils
+from functools import partial
 
 
 def _join_layer(join):
@@ -38,7 +42,7 @@ def split_kwargs(kwargs, *classes):
     return class_kwargs, remaining_kwargs
 
 
-class Identity(K.Layer):
+class Identity(K.layers.Layer):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -116,6 +120,145 @@ class SkipConnection:
         y = self.join([y, inputs])
         return y
     
+    
+class Downsample(K.layers.Layer):
+    """
+    Downsamples an input tensor by an integer factor along spatial axes. Spatial
+    axes are assumed to be (1, 2).
+    
+    Parameters:
+    
+    factor (int, tuple) - downsampling factor
+    """
+    
+    def __init__(self, factor, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if isinstance(factor, int):
+            self.factor_h = factor
+            self.factor_w = factor
+        else:
+            self.factor_h, self.factor_w = factor
+        if self.factor_h < 1 or self.factor_w < 1:
+            raise ValueError("Downsampling factor is < 1")
+
+    def call(self, inputs):
+        if self.factor_h == self.factor_w == 1:
+            return inputs
+        _, H, W, _ = inputs.shape
+        if (H % self.factor_h != 0) or (W % self.factor_w != 0):
+            warnings.warn(f"Tensor {inputs.name} dimensions are not multiples of the "
+                          "downscale factors")
+        return inputs[:, ::self.factor_h, ::self.factor_w, :]
+    
+    
+class GroupConv2D(K.layers.Layer):
+    
+    @staticmethod
+    def convert_data_format(df_str):
+        if df_str is None:
+            return "NHWC", -1
+        s = df_str.lower()
+        if s == "channels_first":
+            return "NCHW", 1
+        elif s == "channels_last":
+            return "NHWC", -1
+        else:
+            raise ValueError(f"Invalid data format `{df_str}`")       
+    
+    def __init__(
+        self, 
+        groups,
+        filters,
+        kernel_size,
+        strides = 1,
+        padding = "same",
+        data_format = None,
+        dilation_rate = 1,
+        activation = "linear",
+        use_bias = True,
+        kernel_initializer = "glorot_uniform",
+        bias_initializer = "zeros",
+        kernel_regularizer = None,
+        bias_regularizer = None,
+        activity_regularizer = None,
+        kernel_constraint = None,
+        bias_constraint = None,
+        trainable = True,
+        name = None,
+        **kwargs
+    ):
+        act_reg = K.regularizers.get(activity_regularizer)
+        super().__init__(
+            trainable = trainable, name = name, activity_regularizer = act_reg, **kwargs
+        )
+        self.groups = int(groups)
+        self.filters = int(filters)
+        if self.filters % self.groups:
+            raise ValueError("Output filters must a multiple of `groups`")
+        self.kernel_size = conv_utils.normalize_tuple(kernel_size, 2, 'kernel_size')
+        self.strides = conv_utils.normalize_tuple(strides, 2, 'strides')
+        self.dilation_rate = conv_utils.normalize_tuple(dilation_rate, 2, 'dilation_rate')
+        self.padding = padding.upper()
+        self.data_format, self.channel_axis = self.convert_data_format(data_format)
+        self.activation = K.activations.get(activation)
+        self.use_bias = use_bias
+        self.weights_config = dict(
+            name = "kernel",
+            initializer = K.initializers.get(kernel_initializer),
+            regularizer = K.regularizers.get(kernel_regularizer),
+            constraint = K.constraints.get(kernel_constraint),
+            trainable = True,
+            dtype = self.dtype,
+        )
+        self.bias_config = dict(
+            name = "bias",
+            shape = (self.filters,),
+            initializer = K.initializers.get(bias_initializer),
+            regularizer = K.regularizers.get(bias_regularizer),
+            constraint = K.constraints.get(bias_constraint),
+            trainable = True,
+            dtype = self.dtype,
+        )
+        
+    def build(self, input_shape):
+        if len(input_shape) != 4:
+            raise ValueError("Invalid input shape")
+        channels = input_shape[self.channel_axis]
+        group_shape = list(input_shape)
+        if channels % self.groups:
+            raise ValueError("Input channels must be a multiple of `groups`")
+
+        kernel_shape = self.kernel_size + (channels // self.groups, self.filters // self.groups)
+        self.kernels = [self.add_weight(shape = kernel_shape, **self.weights_config) 
+                        for _ in range(self.groups)]
+        self.bias = self.add_weight(**self.bias_config) if self.use_bias else None
+        if not isinstance(self.padding, (list, tuple)):
+            op_padding = self.padding.upper()
+        self._conv_op = partial(
+            tf.nn.conv2d, 
+            strides = self.strides, 
+            padding = self.padding, 
+            data_format = self.data_format, 
+            dilations = self.dilation_rate, 
+        )
+        self._bias_add_op = partial(
+            tf.nn.bias_add,
+            bias = self.bias,
+            data_format = self.data_format,
+        )
+        self.built = True
+
+    def call(self, inputs):
+        if self.groups == 1:
+            outputs = self._conv_op(inputs, self.kernels[0])
+        else:
+            input_groups = tf.split(inputs, self.groups, axis = self.channel_axis)
+            output_groups = [self._conv_op(g, k) for g, k in zip(input_groups, self.kernels)]
+            outputs = tf.concat(output_groups, axis = self.channel_axis)
+        outputs = self._bias_add_op(outputs) if self.use_bias else outputs
+        outputs = self.activation(outputs) if self.activation is not None else outputs
+        return outputs
+            
     
 class ConvBlock:
     """
@@ -206,7 +349,7 @@ class FactorizedConv2D:
     **kwargs - a standard set of parameters of the `ConvBlock` class
     """
     
-    def __init__(self, kernel_size, factor_size, **kwargs):
+    def __init__(self, kernel_size, factor_size, strides = (1, 1), **kwargs):
         kh, kw = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
         fh, fw = (factor_size, factor_size) if isinstance(factor_size, int) else factor_size
         
@@ -220,7 +363,8 @@ class FactorizedConv2D:
         
         n_layers = (kh - 1) // (fh - 1)
         conv = ConvBlock(kernel_size = (fh, fw), **kwargs)
-        self.module = Composition([conv]*n_layers)
+        stride_conv = ConvBlock(kernel_size = (fh, fw), strides = strides, **kwargs)
+        self.module = Composition([conv]*(n_layers - 1) + [stride_conv])
         
     def __call__(self, inputs):
         return self.module(inputs)
@@ -246,28 +390,41 @@ class SpatialSeparableConv2D:
     **kwargs - a standard set of parameters of the `ConvBlock` class 
     """
     
-    def __init__(self, filters, kernel_size, filters_in = None, row_first = True, **kwargs):        
+    def __init__(
+        self,
+        filters, 
+        kernel_size, 
+        filters_in = None, 
+        row_first = True, 
+        strides = (1, 1), 
+        **kwargs
+    ):        
         filters_in = filters if filters_in is None else filters_in
         kh, kw = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size        
         if row_first:
             conv_1xN = ConvBlock(filters = filters_in, kernel_size = (1, kw), **kwargs)
-            conv_Nx1 = ConvBlock(filters = filters, kernel_size = (kh, 1), **kwargs)
+            conv_Nx1 = ConvBlock(
+                filters = filters, kernel_size = (kh, 1), strides = strides, **kwargs
+            )
             self.module = Composition([conv_1xN, conv_Nx1])
         else:
             conv_Nx1 = ConvBlock(filters = filters_in, kernel_size = (kh, 1), **kwargs)
-            conv_1xN = ConvBlock(filters = filters, kernel_size = (1, kw), **kwargs)
+            conv_1xN = ConvBlock(
+                filters = filters, kernel_size = (1, kw), strides = strides, **kwargs
+            )
             self.module = Composition([conv_Nx1, conv_1xN])
         
     def __call__(self, inputs):
         return self.module(inputs)
     
     
-class FullSeparableConv2D:
+class FlattenedConv2D:
     """
     A 2D convolution factorized into a composition of three 1D convolutions in 
     the both spatial and channel domains, similar to how a depthwise-separable 
     convolution is factorized. For a kernel size HxWxC the resulting 
-    factorization will be a composition of 1xWx1, Hx1x1 and 1x1xC convolutions. 
+    factorization will be a composition of 1xWx1, Hx1x1 and 1x1xC convolutions.
+    For more information refer to: https://arxiv.org/pdf/1412.5474.pdf
     
     Parameters:
     
@@ -395,7 +552,7 @@ class DenseNetBlock:
         return x
     
     
-class DropAvg(K.Layer):
+class DropAvg(K.layers.Layer):
     """
     Implements an average of a random subset of the input tensors. Has two 
     strategies for sampling: 
@@ -756,7 +913,7 @@ class InceptionV1A:
         reduction_3x3 = ConvBlock(filters = inputs_3x3, **pw_kwargs)
         reduction_5x5 = ConvBlock(filters = inputs_5x5, **pw_kwargs)
         reduction_pool = ConvBlock(filters = filters_pool, **pw_kwargs)
-        pool = L.MaxPooling2D(pool_size = (3, 3), strides = strides, padding = padding)
+        pool = L.MaxPooling2D(pool_size = (3, 3), strides = strides, padding = "same")
         self.module = Composition([
             Parallel([
                 conv_1x1,
@@ -823,7 +980,7 @@ class InceptionV2A:
         reduction_3x3 = ConvBlock(filters = inputs_3x3, **pw_kwargs)
         reduction_5x5 = ConvBlock(filters = inputs_5x5, **pw_kwargs)
         reduction_pool = ConvBlock(filters = filters_pool, **pw_kwargs)
-        pool = L.MaxPooling2D(pool_size = (3, 3), strides = strides, padding = padding)
+        pool = L.MaxPooling2D(pool_size = (3, 3), strides = strides, padding = "same")
         self.module = Composition([
             Parallel([
                 conv_1x1,
@@ -845,6 +1002,7 @@ class InceptionV2B:
     convolutions are factorized into asymmetric 1xN and Nx1 convolutions. 
     A 2Nx2N kernel is further factorized into a sequence of NxN convolutions. 
     For more information refer to Fig. 6 in: https://arxiv.org/pdf/1409.4842.pdf
+    As paper suggests, this module should not be used early in the network.
     
     Parameters:
     
@@ -880,24 +1038,25 @@ class InceptionV2B:
     ):    
         super().__init__()
         (conv_kwargs, bn_kwargs), _ = split_kwargs(kwargs, L.Conv2D, L.BatchNormalization)
-        pw_kwargs = dict(
-            strides = (1, 1), kernel_size = (1, 1), schema = schema, **conv_kwargs, **bn_kwargs
+        pw_kwargs = dict(kernel_size = (1, 1), schema = schema, **conv_kwargs, **bn_kwargs)
+        conv_kwargs = dict(padding = "same", schema = schema, **conv_kwargs, **bn_kwargs)
+        conv_1x1 = ConvBlock(
+            filters = filters_1x1, kernel_size = (1, 1), strides = strides, **conv_kwargs
         )
-        conv_kwargs = dict(
-            strides = strides, padding = "same", schema = schema, **conv_kwargs, **bn_kwargs
-        )
-        conv_1x1 = ConvBlock(filters = filters_1x1, kernel_size = (1, 1), **conv_kwargs)
         conv_3x3 = SpatialSeparableConv2D(
-            filters = filters_3x3, kernel_size = kernel_size, **conv_kwargs
+            filters = filters_3x3, kernel_size = kernel_size, strides = strides, **conv_kwargs
         )
-        conv_5x5 = SpatialSeparableConv2D(
+        conv_5x5_1 = SpatialSeparableConv2D(
             filters = filters_5x5, kernel_size = kernel_size, **conv_kwargs
         )
-        conv_5x5 = Composition([conv_5x5, conv_5x5])
+        conv_5x5_2 = SpatialSeparableConv2D(
+            filters = filters_5x5, kernel_size = kernel_size, strides = strides, **conv_kwargs
+        )
+        conv_5x5 = Composition([conv_5x5_1, conv_5x5_2])
         reduction_3x3 = ConvBlock(filters = inputs_3x3, **pw_kwargs)
         reduction_5x5 = ConvBlock(filters = inputs_5x5, **pw_kwargs)
         reduction_pool = ConvBlock(filters = filters_pool, **pw_kwargs)
-        pool = L.MaxPooling2D(pool_size = (3, 3), strides = strides, padding = padding)
+        pool = L.MaxPooling2D(pool_size = (3, 3), strides = strides, padding = "same")
         self.module = Composition([
             Parallel([
                 conv_1x1,
@@ -955,16 +1114,23 @@ class InceptionV2C:
         pw_kwargs = dict(
             strides = (1, 1), kernel_size = (1, 1), schema = schema, **conv_kwargs, **bn_kwargs
         )
-        conv_kwargs = dict(
-            strides = strides, padding = "same", schema = schema, **conv_kwargs, **bn_kwargs
+        conv_kwargs = dict(padding = "same", schema = schema, **conv_kwargs, **bn_kwargs)
+        conv_1x1 = ConvBlock(
+            filters = filters_1x1, kernel_size = (1, 1), strides = strides, **conv_kwargs
         )
-        conv_1x1 = ConvBlock(filters = filters_1x1, kernel_size = (1, 1), **conv_kwargs)
-        conv_1x3_3 = ConvBlock(filters = filters_3x3, kernel_size = (1, 3), **conv_kwargs)
-        conv_3x1_3 = ConvBlock(filters = filters_3x3, kernel_size = (3, 1), **conv_kwargs)
+        conv_1x3_3 = ConvBlock(
+            filters = filters_3x3, kernel_size = (1, 3), strides = strides, **conv_kwargs
+        )
+        conv_3x1_3 = ConvBlock(
+            filters = filters_3x3, kernel_size = (3, 1), strides = strides, **conv_kwargs
+        )
         conv_3x3_5 = ConvBlock(filters = filters_5x5, kernel_size = (3, 3), **conv_kwargs)
-        conv_1x3_5 = ConvBlock(filters = filters_5x5, kernel_size = (1, 3), **conv_kwargs)
-        conv_3x1_5 = ConvBlock(filters = filters_5x5, kernel_size = (3, 1), **conv_kwargs)
-        
+        conv_1x3_5 = ConvBlock(
+            filters = filters_5x5, kernel_size = (1, 3), strides = strides, **conv_kwargs
+        )
+        conv_3x1_5 = ConvBlock(
+            filters = filters_5x5, kernel_size = (3, 1), strides = strides, **conv_kwargs
+        )
         conv_3x3 = Parallel([conv_1x3_3, conv_3x1_3])
         conv_5x5 = Composition([
             conv_3x3_5, 
