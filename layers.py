@@ -129,10 +129,15 @@ class Downsample(K.layers.Layer):
     Parameters:
     
     factor (int, tuple) - downsampling factor
+    data_format (str) - "NHWC" or "NCHW" string for channel-first and 
+        channels-last input tensor layout respectively
     """
     
-    def __init__(self, factor, *args, **kwargs):
+    def __init__(self, factor, data_format = "NHWC", *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if data_format not in {"NCHW", "NHWC"}:
+            raise ValueError(f"Invalid data format {data_format}")
+        self.data_format = data_format
         if isinstance(factor, int):
             self.factor_h = factor
             self.factor_w = factor
@@ -144,11 +149,17 @@ class Downsample(K.layers.Layer):
     def call(self, inputs):
         if self.factor_h == self.factor_w == 1:
             return inputs
-        _, H, W, _ = inputs.shape
+        if self.data_format == "NHWC":
+            _, H, W, _ = inputs.shape
+        else:
+            _, _, H, W = inputs.shape
         if (H % self.factor_h != 0) or (W % self.factor_w != 0):
             warnings.warn(f"Tensor {inputs.name} dimensions are not multiples of the "
                           "downscale factors")
-        return inputs[:, ::self.factor_h, ::self.factor_w, :]
+        if self.data_format == "NHWC":
+            return inputs[:, ::self.factor_h, ::self.factor_w, :]
+        else:
+            return inputs[:, :, ::self.factor_h, ::self.factor_w]
     
     
 class GroupConv2D(K.layers.Layer):
