@@ -220,6 +220,8 @@ class Resize(K.layers.Layer):
     
     
 class GroupConv2D(K.layers.Layer):
+    """
+    """
     
     @staticmethod
     def convert_data_format(df_str):
@@ -325,6 +327,50 @@ class GroupConv2D(K.layers.Layer):
             outputs = tf.concat(output_groups, axis = self.channel_axis)
         outputs = self._bias_add_op(outputs) if self.use_bias else outputs
         outputs = self.activation(outputs) if self.activation is not None else outputs
+        return outputs
+    
+    
+class GroupShuffle(K.layers.Layer):
+    """
+    Channel shuffling operation for a grouped convolution. Given the number of
+    groups, permutes the channels such that channels from each group are places
+    into each group. Example:
+    
+    [ 1 2 3 | 4 5 6 | 7 8 9 ] --> [ 1 4 7 | 2 5 8 | 3 6 9 ]
+    
+    For more information refer to a ShuffleNet paper: 
+    https://arxiv.org/pdf/1707.01083.pdf
+    
+    Parameters:
+    
+    groups (int) - number of groups
+    
+    data_format (str) - a standard Keras data format string. 
+        Default: "channels_last"
+    """
+    
+    def __init__(self, groups, data_format = "channels_last", *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if data_format not in {"channels_last", "channels_first"}:
+            raise ValueError(f"Invalid data format `{data_format}`")
+        self.groups = groups
+        self.data_format = data_format
+        
+    def call(self, inputs):
+        if self.data_format == "channels_last":
+            _, H, W, C = inputs.shape
+            if C % self.groups:
+                raise ValueError("Number of input channels must be a multiple of `groups`")
+            g = tf.reshape(inputs, (-1, H, W, C // self.groups, self.groups))
+            g = tf.transpose(g, [0, 1, 2, 4, 3])
+            outputs = tf.reshape(g, (-1, H, W, C))
+        else:
+            _, C, H, W = inputs.shape
+            if C % self.groups:
+                raise ValueError("Number of input channels must be a multiple of `groups`")
+            g = tf.reshape(inputs, (-1, self.groups, C // self.groups, H, W))
+            g = tf.transpose(g, [0, 2, 1, 3, 4])
+            outputs = tf.reshape(g, (-1, H, W, C))
         return outputs
             
     
@@ -581,7 +627,7 @@ class ResidualConv2D:
             (conv_kwargs, join_kwargs), _ = split_kwargs(kwargs, L.Conv2D, _join_layer(join))
         else:
             (conv_kwargs,), _ = split_kwargs(kwargs, ConvBlock)
-        conv = ConvBlock(schema = schema, padding = padding, **conv_kwargs)
+        conv = ConvBlock(schema = schema, padding = padding, strides = (1, 1), **conv_kwargs)
         block = Composition([conv]*n_blocks)
         self.module = SkipConnection(block, join = join, **join_kwargs)
         
@@ -1227,14 +1273,42 @@ class InceptionV2C:
     
 class ResNeXtBlock:
     """
+    ResNeXt module, which is essentialy a grouped convolution sandwiched bitween
+    two pointwise convolutions for dimensionality reduction and expansion and a
+    skip connection. 
+    For more information refer to: https://arxiv.org/pdf/1611.05431.pdf
+    
+    Parameters:
+    
+    filters (int) - number of filters in the first 1x1 convolution as well as in
+        the grouped convolution layer
+        
+    groups (int) - number of groups in the grouped convolution 
+    
+    kernel_size (int) - kernel size of the grouped convolution
+    
+    schema (str) - module layout config string with letters representing layers 
+        in a sequence:
+            A - activation
+            B - batch normalization
+            C - contraction pointwise conv
+            E - expansion pointwise conv
+            G - grouped convolution
+        All whitespaces are ignored. Default: "CBAGBAEBA"
+        
+    join (str, layer) - a join operation for a skip connection. Default: "add"
+    
+    **kwargs - a standard set of parameters for the Conv2D, GroupConv2D, 
+        BatchNormalization and join layers
     """
+    
     def __init__(
         self, 
         filters, 
         groups, 
         kernel_size, 
         activation = "linear", 
-        schema = "CBA", 
+        schema = "CBAGBAEBA", 
         data_format = "channels_last",
         join = "add",
         **kwargs
@@ -1245,17 +1319,16 @@ class ResNeXtBlock:
         (conv_kwargs, gconv_kwargs, bn_kwargs, join_kwargs), _ = split_kwargs(
             kwargs, L.Conv2D, GroupConv2D, L.BatchNormalization, _join_layer(join)
         )
-        conv_kwargs["schema"] = schema
         conv_kwargs["activation"] = activation
         conv_kwargs["data_format"] = data_format
         conv_kwargs["strides"] = (1, 1)
         self.bn = L.BatchNormalization(**bn_kwargs)
-        self.conv_compress = ConvBlock(
+        self.conv_compress = L.Conv2D(
             filters = filters,
             kernel_size = (1, 1),
             **conv_kwargs
         )
-        self.conv_expand = partial(ConvBlock, kernel_size = (1, 1), **conv_kwargs)
+        self.conv_expand = partial(L.Conv2D, kernel_size = (1, 1), **conv_kwargs)
         self.gconv = GroupConv2D(
             filters = filters, 
             groups = groups, 
@@ -1266,20 +1339,85 @@ class ResNeXtBlock:
         )
         self.act = _Activation(activation)
         self.join = _join_layer(join)(**join_kwargs)
-        self.schema = schema
+        self.schema = schema.replace(" ", "")
         
     def __call__(self, inputs):
         channels = inputs.shape[self.channel_axis]
-        alias = {"A": self.act, "B": self.bn, "C": self.gconv}
+        alias = {
+            "A": self.act, 
+            "B": self.bn, 
+            "C": self.conv_compress, 
+            "E": self.conv_expand(filters = channels), 
+            "G": self.gconv
+        }
         module = SkipConnection(
-            Composition([
-                self.conv_compress, 
-                Composition([alias[c] for c in self.schema]), 
-                self.conv_expand(filters = channels),
-            ]),
+            Composition([alias[c] for c in self.schema]), 
             join = self.join,
         )
         outputs = module(inputs)
         return outputs
+     
         
-        
+class ShuffleNetBlock:
+    
+    def __init__(
+        self, 
+        filters_in,
+        filters_out,
+        groups, 
+        kernel_size, 
+        strides = (1, 1),
+        padding = "same",
+        activation = "linear", 
+        schema = "CBASDBEB", 
+        data_format = "channels_last",
+        join = "concat",
+        **kwargs
+    ):
+        if data_format not in {"channels_first", "channels_last"}:
+            raise ValueError(f"Invalid data format `{data_format}`")
+        (gconv_kwargs, dwconv_kwargs, bn_kwargs, join_kwargs), _ = split_kwargs(
+            kwargs, GroupConv2D, L.DepthwiseConv2D, L.BatchNormalization, _join_layer(join)
+        )
+        gconv_kwargs["data_format"] = data_format
+        gconv_kwargs["groups"] = groups
+        gconv_kwargs["kernel_size"] = (1, 1)
+        bn = L.BatchNormalization(**bn_kwargs)
+        conv_compress = GroupConv2D(filters = filters_in, **gconv_kwargs)
+        conv_expand = GroupConv2D(filters = filters_out, **gconv_kwargs)
+        dwconv = L.DepthwiseConv2D(
+            strides = strides, 
+            kernel_size = kernel_size, 
+            padding = padding,
+            data_format = data_format, 
+            **dwconv_kwargs
+        )
+        act = _Activation(activation)
+        shuffle = GroupShuffle(groups = groups, data_format = data_format)
+        join = _join_layer(join)(**join_kwargs)
+        pool = L.AveragePooling2D(
+            pool_size = (3, 3), strides = strides, padding = padding, data_format = data_format
+        )
+        alias = {
+            "A": act,
+            "B": bn,
+            "C": conv_compress,
+            "D": dwconv,
+            "E": conv_expand,
+            "S": shuffle,
+        }
+        main = Composition([alias[c] for c in schema.replace(" ", "")])
+        if strides == (1, 1):
+            self.module = Composition([
+                SkipConnection(main, join = join),
+                act,
+            ])
+        else:
+            self.module = Composition([
+                Parallel([main, pool]),
+                join,
+                act,
+            ])
+            
+    def __call__(self, inputs):
+        return self.module(inputs)
