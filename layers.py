@@ -790,11 +790,9 @@ class MobileNetV1Block:
     def __init__(
         self, kernel_size, strides = (1, 1), activation = 'linear', schema = "DBACBA", **kwargs
     ):    
-        super().__init__()
         (conv_kwargs, dw_kwargs, bn_kwargs,), _ = split_kwargs(
             kwargs, L.Conv2D, L.DepthwiseConv2D, L.BatchNormalization
         )
-        print(conv_kwargs, dw_kwargs, bn_kwargs)
         dwconv = L.DepthwiseConv2D(kernel_size = kernel_size, strides = strides, **dw_kwargs)
         conv = L.Conv2D(kernel_size = (1, 1), strides = (1, 1), **conv_kwargs)
         bn = L.BatchNormalization(**bn_kwargs)
@@ -849,7 +847,6 @@ class MobileNetV2Block:
         schema = "CBADBALB", 
         **kwargs
     ):    
-        super().__init__()
         (conv_kwargs, dw_kwargs, bn_kwargs), _ = split_kwargs(
             kwargs, L.Conv2D, L.DepthwiseConv2D, L.BatchNormalization
         )
@@ -921,7 +918,6 @@ class MobileNetV3Block:
         schema = "CBADBASLB", 
         **kwargs
     ):    
-        super().__init__()
         (conv_kwargs, dw_kwargs, bn_kwargs), _ = split_kwargs(
             kwargs, L.Conv2D, L.DepthwiseConv2D, L.BatchNormalization
         )
@@ -978,7 +974,6 @@ class InceptionV1A:
         schema = "CBA",
         **kwargs
     ):    
-        super().__init__()
         (conv_kwargs, bn_kwargs), _ = split_kwargs(kwargs, L.Conv2D, L.BatchNormalization)
         pw_kwargs = dict(
             strides = (1, 1), kernel_size = (1, 1), schema = schema, **conv_kwargs, **bn_kwargs
@@ -1043,7 +1038,6 @@ class InceptionV2A:
         schema = "CBA",
         **kwargs
     ):    
-        super().__init__()
         (conv_kwargs, bn_kwargs), _ = split_kwargs(kwargs, L.Conv2D, L.BatchNormalization)
         pw_kwargs = dict(
             strides = (1, 1), kernel_size = (1, 1), schema = schema, **conv_kwargs, **bn_kwargs
@@ -1115,7 +1109,6 @@ class InceptionV2B:
         schema = "CBA",
         **kwargs
     ):    
-        super().__init__()
         (conv_kwargs, bn_kwargs), _ = split_kwargs(kwargs, L.Conv2D, L.BatchNormalization)
         pw_kwargs = dict(kernel_size = (1, 1), schema = schema, **conv_kwargs, **bn_kwargs)
         conv_kwargs = dict(padding = "same", schema = schema, **conv_kwargs, **bn_kwargs)
@@ -1188,7 +1181,6 @@ class InceptionV2C:
         schema = "CBA",
         **kwargs
     ):    
-        super().__init__()
         (conv_kwargs, bn_kwargs), _ = split_kwargs(kwargs, L.Conv2D, L.BatchNormalization)
         pw_kwargs = dict(
             strides = (1, 1), kernel_size = (1, 1), schema = schema, **conv_kwargs, **bn_kwargs
@@ -1232,3 +1224,62 @@ class InceptionV2C:
     def __call__(self, inputs):
         return self.module(inputs)
     
+    
+class ResNeXtBlock:
+    """
+    """
+    def __init__(
+        self, 
+        filters, 
+        groups, 
+        kernel_size, 
+        activation = "linear", 
+        schema = "CBA", 
+        data_format = "channels_last",
+        join = "add",
+        **kwargs
+    ):
+        if data_format not in {"channels_first", "channels_last"}:
+            raise ValueError(f"Invalid data format `{data_format}`")
+        self.channel_axis = -1 if data_format == "channels_last" else 1
+        (conv_kwargs, gconv_kwargs, bn_kwargs, join_kwargs), _ = split_kwargs(
+            kwargs, L.Conv2D, GroupConv2D, L.BatchNormalization, _join_layer(join)
+        )
+        conv_kwargs["schema"] = schema
+        conv_kwargs["activation"] = activation
+        conv_kwargs["data_format"] = data_format
+        conv_kwargs["strides"] = (1, 1)
+        self.bn = L.BatchNormalization(**bn_kwargs)
+        self.conv_compress = ConvBlock(
+            filters = filters,
+            kernel_size = (1, 1),
+            **conv_kwargs
+        )
+        self.conv_expand = partial(ConvBlock, kernel_size = (1, 1), **conv_kwargs)
+        self.gconv = GroupConv2D(
+            filters = filters, 
+            groups = groups, 
+            strides = (1, 1),
+            kernel_size = kernel_size, 
+            data_format = data_format, 
+            **gconv_kwargs
+        )
+        self.act = _Activation(activation)
+        self.join = _join_layer(join)(**join_kwargs)
+        self.schema = schema
+        
+    def __call__(self, inputs):
+        channels = inputs.shape[self.channel_axis]
+        alias = {"A": self.act, "B": self.bn, "C": self.gconv}
+        module = SkipConnection(
+            Composition([
+                self.conv_compress, 
+                Composition([alias[c] for c in self.schema]), 
+                self.conv_expand(filters = channels),
+            ]),
+            join = self.join,
+        )
+        outputs = module(inputs)
+        return outputs
+        
+        
