@@ -1,5 +1,5 @@
 from tensorflow.keras import layers as K
-import layers as L
+from . import layers as L
 import inspect
 import copy
 
@@ -51,8 +51,15 @@ class Meta(type):
 
 
 _layer_list = [
-    L.Downsample,
+    L.Identity,
+    L.DownSampling2D,
+    L.Resize,
     L.DropAvg,
+    L.GroupShuffle,
+    L.GroupConv2D,
+    L.GlobalAvgPool2D,
+    L.GlobalMaxPool2D,
+    
     K.Layer,
     K.Input,
     K.InputLayer,
@@ -126,14 +133,14 @@ _layer_list = [
     K.AvgPool3D,
     K.GlobalAveragePooling1D,
     K.GlobalAvgPool1D,
-    K.GlobalAveragePooling2D,
-    K.GlobalAvgPool2D,
+#     K.GlobalAveragePooling2D,
+#     K.GlobalAvgPool2D,
     K.GlobalAveragePooling3D,
     K.GlobalAvgPool3D,
     K.GlobalMaxPooling1D,
     K.GlobalMaxPool1D,
-    K.GlobalMaxPooling2D,
-    K.GlobalMaxPool2D,
+#     K.GlobalMaxPooling2D,
+#     K.GlobalMaxPool2D,
     K.GlobalMaxPooling3D,
     K.GlobalMaxPool3D,
     K.MaxPooling1D,
